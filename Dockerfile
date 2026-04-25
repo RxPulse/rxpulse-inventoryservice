@@ -1,10 +1,12 @@
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
+RUN apk update && apk upgrade --no-cache
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY src/ ./src/
 
-FROM node:18-alpine AS production
+FROM node:20-alpine AS production
+RUN apk update && apk upgrade --no-cache
 RUN addgroup -S rxpulse && \
     adduser -S rxpulse -G rxpulse
 WORKDIR /app
