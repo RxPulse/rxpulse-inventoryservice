@@ -1,0 +1,141 @@
+name: inventoryservice CI
+
+run-name: "inventoryservice — ${{ github.event.head_commit.message || github.event.pull_request.title }} (${{ github.sha }})"
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "src/**"
+      - ".github/workflows/inventoryservice.yaml"
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - "src/**"
+      - ".github/workflows/inventoryservice.yaml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  sonar-and-snyk:
+    if: github.event_name == 'pull_request'
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/code-scan.yaml@develop
+    with:
+      service-name: inventory
+      node-version: "18"
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  build-image:
+    needs: [sonar-and-snyk]
+    if: |
+      always() &&
+      (
+        (github.event_name == 'pull_request' && needs.sonar-and-snyk.result == 'success') ||
+        github.event_name == 'push'
+      )
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/build-image.yaml@develop
+    with:
+      service-name: inventory
+      service-path: .
+      run-trivy: ${{ github.event_name == 'pull_request' }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  push-image:
+    needs: [build-image]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      needs.build-image.result == 'success'
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/push-image.yaml@develop
+    with:
+      service-name: inventory
+      image-tag: ${{ needs.build-image.outputs.image-tag }}
+      tag-exists: ${{ needs.build-image.outputs.tag-exists }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  update-helm-values-dev:
+    needs: [push-image, build-image]
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      github.ref_name == 'develop' &&
+      needs.push-image.result == 'success'
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/update-helm.yaml@develop
+    with:
+      service-name: inventory
+      image-tag: ${{ needs.build-image.outputs.image-tag }}
+      target-branch: develop
+    secrets:
+      HELM_REPO_TOKEN: ${{ secrets.HELM_REPO_TOKEN }}
+      HELM_REPO_OWNER: ${{ secrets.HELM_REPO_OWNER }}
+
+  prod-approval-gate:
+    needs: [push-image, build-image]
+    if: |
+      always() &&
+      github.event_name != 'pull_request' &&
+      github.ref_name == 'main' &&
+      needs.push-image.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Approved — proceeding to update Helm chart for Production
+        run: echo "Production deployment approved for tag ${{ needs.build-image.outputs.image-tag }}"
+
+  update-helm-values-prod:
+    needs: [prod-approval-gate, build-image]
+    if: |
+      always() &&
+      needs.prod-approval-gate.result == 'success'
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/update-helm.yaml@develop
+    with:
+      service-name: inventory
+      image-tag: ${{ needs.build-image.outputs.image-tag }}
+      target-branch: main
+    secrets:
+      HELM_REPO_TOKEN: ${{ secrets.HELM_REPO_TOKEN }}
+      HELM_REPO_OWNER: ${{ secrets.HELM_REPO_OWNER }}
+
+  notify:
+    needs: [sonar-and-snyk, build-image, push-image, update-helm-values-dev, prod-approval-gate, update-helm-values-prod]
+    if: always()
+    uses: RxPulse/rxpulse-ci-workflows/.github/workflows/notify.yaml@develop
+    with:
+      service-name: inventory
+      branch: ${{ github.ref_name }}
+      image-tag: ${{ needs.build-image.outputs.image-tag || 'N/A' }}
+      actor: ${{ github.actor }}
+      commit-message: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+      commit-sha: ${{ github.sha }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      result-sonar-snyk: ${{ needs.sonar-and-snyk.outputs.sonarqube_result || 'skipped' }}
+      result-build: ${{ needs.build-image.outputs.build-result || 'skipped' }}
+      result-trivy: ${{ needs.build-image.outputs.trivy-result || 'skipped' }}
+      result-push: ${{ needs.push-image.outputs.push-result || 'skipped' }}
+      result-helm-dev: ${{ needs.update-helm-values-dev.result || 'skipped' }}
+      result-approval: ${{ needs.prod-approval-gate.result || 'skipped' }}
+      result-helm-prod: ${{ needs.update-helm-values-prod.result || 'skipped' }}
+    secrets:
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      NOTIFY_FROM_EMAIL: ${{ secrets.NOTIFY_FROM_EMAIL }}
+      NOTIFY_TO_EMAIL: ${{ secrets.NOTIFY_TO_EMAIL }}
